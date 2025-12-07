@@ -233,6 +233,8 @@ habitat:
         type: SPL
       distance_to_goal_reward:
         type: DistanceToGoalReward
+      latest_thought_text:
+        type: LatestThoughtText
     goal_sensor_uuid: pointgoal_with_gps_compass
     count_obj_collisions: true
     settle_steps: 5

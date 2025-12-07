@@ -1055,6 +1055,32 @@ class NavigationMovementAgentAction(SimulatorTaskAction):
                 mn.Deg(amount), mn.Vector3.x_axis()
             )
 
+@registry.register_measure
+class LatestThoughtText(Measure):
+    """Measurement that returns the latest thought text from the VLM."""
+    
+    cls_uuid: str = "latest_thought_text"
+    
+    def __init__(self, sim, config, *args, **kwargs):
+        self._sim = sim
+        self._config = config
+        super().__init__()
+
+    def _get_uuid(self, *args, **kwargs):
+        return self.cls_uuid
+
+    def reset_metric(self, episode, task, *args, **kwargs):
+        self._metric = None
+
+    def update_metric(self, episode, task, *args, **kwargs):
+        # Get the thought text from the task
+        if hasattr(task, 'latest_thought_text') and task.latest_thought_text is not None:
+            self._metric = task.latest_thought_text
+            # Clear it after capturing
+            task.latest_thought_text = None
+        else:
+            self._metric = None
+
 
 @registry.register_task_action
 class MoveForwardAction(SimulatorTaskAction):

@@ -37,6 +37,7 @@ __all__ = [
     "SPLMeasurementConfig",
     "SoftSPLMeasurementConfig",
     "DistanceToGoalRewardMeasurementConfig",
+    "LatestThoughtTextMeasurementConfig",
     # NAVIGATION LAB SENSORS
     "ObjectGoalSensorConfig",
     "InstanceImageGoalSensorConfig",
@@ -1383,6 +1384,13 @@ class DistanceToGoalRewardMeasurementConfig(MeasurementConfig):
 class AnswerAccuracyMeasurementConfig(MeasurementConfig):
     type: str = "AnswerAccuracy"
 
+@dataclass
+class LatestThoughtTextMeasurementConfig(MeasurementConfig):
+    r"""
+    Measurement that returns the latest thought text from the VLM.
+    Returns None if no thought was generated in the current step.
+    """
+    type: str = "LatestThoughtText"
 
 @dataclass
 class TaskConfig(HabitatBaseConfig):
@@ -2681,6 +2689,12 @@ cs.store(
     group="habitat/task/measurements",
     name="habitat_perf",
     node=RuntimePerfStatsMeasurementConfig,
+)
+cs.store(
+    package="habitat.task.measurements.latest_thought_text",
+    group="habitat/task/measurements",
+    name="latest_thought_text",
+    node=LatestThoughtTextMeasurementConfig,
 )
 
 
