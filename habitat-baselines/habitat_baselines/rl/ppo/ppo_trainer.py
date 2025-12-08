@@ -519,11 +519,6 @@ class PPOTrainer(BaseRLTrainer):
 
             for i, info in enumerate(infos):
                 env_idx = env_slice.start + i
-                
-                if info.get('success', 0.0) > 0.5:
-                    rewards[i] += 2.5
-                    sys.stderr.write(f"Env {env_idx}: SUCCESS +2.5 reward.\n")
-                    sys.stderr.flush()
 
                 prev_action = int(self.prev_actions[env_idx].item())
             
@@ -553,12 +548,12 @@ class PPOTrainer(BaseRLTrainer):
                     log_prefix = f"Env {env_idx} | Action: {ACTION_MAP.get(prev_action, 'Unknown')} | Thought: '{thought_text[:30]}...'"
                     
                     if is_consistent:
-                        rewards[i] += 0.1 
-                        sys.stderr.write(f"{log_prefix} -> CONSISTENT +0.1 reward.\n")
+                        rewards[i] += 0.02 
+                        sys.stderr.write(f"{log_prefix} -> CONSISTENT +0.02 reward.\n")
                         sys.stderr.flush()
                     else:
-                        rewards[i] -= 0.1 
-                        sys.stderr.write(f"{log_prefix} -> INCONSISTENT -0.1 penalty.\n")
+                        rewards[i] -= 0.02 
+                        sys.stderr.write(f"{log_prefix} -> INCONSISTENT -0.02 penalty.\n")
                         sys.stderr.flush()
                     
                     # Clear the thought after evaluating one action against it
