@@ -80,37 +80,48 @@ def is_action_consistent_with_thought(
         4: "THINK"
     } 
     action_name = ACTION_MAP.get(action, "UNKNOWN")
-    logger.info(f"Evaluating action '{action_name}' against thought: '{thought_text}' with distance change: {distance_change:.4f}")
     thought_text = thought_text.lower()
 
-    # Direct Action Consistency (Must match explicit commands)
+    # These are words that imply a specific movement or intent.
+    nav_keywords = [
+        "left", "right", "forward", "back", 
+        "turn", "move", "go", "stop", 
+        "approach", "find", "search"
+    ]
+    
+    # Check for Keyword Presence
+    has_nav_keyword = any(k in thought_text for k in nav_keywords)
+
+    # Handle Non-Directional Thoughts
+    # If the VLM gives NO direction (e.g., "none", "wall ahead", "scenery"),
+    # the only valid physical action is STOP.
+    if not has_nav_keyword:
+        if action_name == "STOP":
+            return True
+        elif action_name == "THINK":
+            return True
+        else:
+            # Moving without a command is inconsistent (Hallucination)
+            return False
+
+    # directional Logic
     if "left" in thought_text and action_name == "TURN_LEFT":
         return True
     if "right" in thought_text and action_name == "TURN_RIGHT":
         return True
     if "stop" in thought_text and action_name == "STOP":
         return True
-    if "forward" in thought_text and action_name == "MOVE_FORWARD":
-        return True
     
-    # Goal-Directed Movement Consistency (for MOVE_FORWARD)
-    is_goal_directed_thought = any(
-        keyword in thought_text for keyword in 
-        ["move forward", "go to", "find the", "approach"]
-    )
+    # Goal-Directed Forward Movement
+    is_goal_directed = any(k in thought_text for k in ["move", "go", "find", "approach"])
+    has_turn_command = "left" in thought_text or "right" in thought_text
     
-    # Successful Forward Movement
-    if is_goal_directed_thought and action_name == "MOVE_FORWARD":
-        if distance_change > 0.01:
-            return True
-        else:
-            return False
+    if is_goal_directed and action_name == "MOVE_FORWARD":
+        if not has_turn_command:
+            return distance_change > 0.01
+        if "forward" in thought_text:
+            return distance_change > 0.01
 
-    # Inconsistent Action (e.g., thought was 'find the object', but agent turned or stopped)
-    if is_goal_directed_thought and action_name in ["TURN_LEFT", "TURN_RIGHT", "STOP"]:
-        # If the high-level goal is to move/find, turning/stopping without a specific mention is inconsistent.
-        return False
-        
     return False
 
 @baseline_registry.register_trainer(name="ddppo")
