@@ -111,6 +111,8 @@ def is_action_consistent_with_thought(
         return True
     if "stop" in thought_text and action_name == "STOP":
         return True
+    if "forward" in thought_text and action_name == "MOVE_FORWARD":
+        return True
     
     # Goal-Directed Forward Movement
     is_goal_directed = any(k in thought_text for k in ["move", "go", "find", "approach"])
