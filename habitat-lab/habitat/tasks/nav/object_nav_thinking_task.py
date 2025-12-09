@@ -281,7 +281,7 @@ class ThinkAction(SimulatorTaskAction):
             {
                 "role": "system",
                 "content": [
-                    {"type": "text", "text": "You are an AI guiding a robot's immediate next action. You are given an image and a target object (e.g., 'find the spoon'). Your goal is to output the STRICTLY NECESSARY NEXT STEP the robot must take. DO NOT include observations, reasoning, or explanations. OUTPUT ONLY A SINGLE, SHORT COMMAND."},
+                    {"type": "text", "text": "You are an AI guiding a robot's immediate next action. You are given an image and a target object (e.g., 'find the spoon'). Your goal is to output the STRICTLY NECESSARY NEXT STEP the robot must take. DO NOT include observations, reasoning, or explanations. OUTPUT ONLY A SINGLE sentence, SHORT COMMAND."},
                 ],
             },
             {
@@ -332,7 +332,8 @@ class ThinkAction(SimulatorTaskAction):
         text = clip.tokenize([thought]).to(self.device)
         # sys.stderr.write(f"[THINK_ACTION_EMBED] Tokenized text shape: {text.shape}\n")
         # sys.stderr.flush()
-        text_features = self.model.encode_text(text)
+        with torch.no_grad():
+            text_features = self.model.encode_text(text)
         # sys.stderr.write(f"[THINK_ACTION_EMBED] CLIP features shape: {text_features.shape}, dtype: {text_features.dtype}\n")
         # sys.stderr.flush()
         result = text_features.detach().cpu().numpy()[0]

@@ -15,20 +15,20 @@ habitat:
     iterator_options:
       max_scene_repeat_steps: 50000
   task:
-    success_reward: 20.0
+    success_reward: 15.0
     slack_reward: -0.01
 
 habitat_baselines:
-  trainer_name: "ppo"
+  trainer_name: "ddppo"
   torch_gpu_id: 0
   tensorboard_dir: "tb"
   video_dir: "video_dir"
   test_episode_count: -1
   eval_ckpt_path_dir: "data/new_checkpoints"
-  num_environments: 1
+  num_environments: 4
   checkpoint_folder: "data/new_checkpoints"
-  num_updates: 25000
-  log_interval: 10
+  num_updates: 50000
+  log_interval: 20
   num_checkpoints: 100
   force_torch_single_threaded: True
 
@@ -45,9 +45,9 @@ habitat_baselines:
       # ppo params
       clip_param: 0.2
       ppo_epoch: 4
-      num_mini_batch: 1  # ← Must be <= num_environments
+      num_mini_batch: 4  # ← Must be <= num_environments
       value_loss_coef: 0.5
-      entropy_coef: 0.01
+      entropy_coef: 0.001
       lr: 2.5e-4
       eps: 1e-5
       max_grad_norm: 0.2
