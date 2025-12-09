@@ -92,24 +92,36 @@ def is_action_consistent_with_thought(
     if not any(k in thought_text for k in nav_keywords):
         return 0.0
 
-    # Turn Logic: Low Reward (Prevents "Spinning" Profit)
-    if "left" in thought_text and action_name == "TURN_LEFT":
-        return 0.05
+    # 2. Turn Logic: Low Reward (Prevents "Spinning" Profit)
+    # We give a small positive reward (0.2) to acknowledge the VLM 
+    # identified the direction correctly, but it's not enough to 
+    # outweigh the cost of thinking/time unless necessary.
+    if "left" in thought_text:
+        return 0.05 if action_name == "TURN_LEFT" else -0.25
         
-    if "right" in thought_text and action_name == "TURN_RIGHT":
-        return 0.05
+    if "right" in thought_text:
+        return 0.05 if action_name == "TURN_RIGHT" else -0.25
 
-    # Stop Logic: High Reward (Safety Critical)
-    if "stop" in thought_text and action_name == "STOP":
-        return 0.05
+    # 3. Stop Logic: High Reward (Safety Critical)
+    if "stop" in thought_text:
+        return 2.0 if action_name == "STOP" else -0.25
 
-    # Forward Logic
+    # 4. Forward Logic: High Reward (Progress Critical)
+    # This is the "Breadcrumb" - we pay big for moving closer.
     forward_intent = "forward" in thought_text or \
                      any(k in thought_text for k in ["move", "go", "approach", "find"])
                      
     if forward_intent:
-        if action_name == "MOVE_FORWARD" and distance_change > 0.01:
-            return 0.5  # JACKPOT: Consistent + Progress
+        if action_name != "MOVE_FORWARD":
+            # If thought says "go" but robot turned/stopped -> Inconsistent
+            return -0.5
+        
+        # If thought says "go" and robot moved forward:
+        # CHECK: Did we actually move? (Avoid wall-bumping)
+        if distance_change > 0.01:
+            return 0.25  # JACKPOT: Consistent + Progress
+        else:
+            return 0.1  # Consistent but no progress (e.g. wall)
     
     return 0.0
 
@@ -138,8 +150,10 @@ class PPOTrainer(BaseRLTrainer):
 
         self.prev_distance_to_goal = None
         self._task_ref = None # Will store a reference to the task instance
+        self.stuck_counter = torch.zeros(self.config.habitat_baselines.num_environments, dtype=torch.int) # To track consecutive same actions per env
         self.prev_actions = torch.zeros(self.config.habitat_baselines.num_environments, dtype=torch.long)
-        self.steps_since_think = None
+        self.active_thoughts = [None] * self.config.habitat_baselines.num_environments
+        self.last_non_think_action = None
 
         # Distributed if the world size would be
         # greater than 1
@@ -297,24 +311,24 @@ class PPOTrainer(BaseRLTrainer):
 
         self._init_envs()
 
-        # if rank0_only():
-        #     # Only the primary process needs to directly interact with VLM/Task logic
-        #     # Assume all envs have the same Task type and grab the reference from env 0
+        if rank0_only():
+            # Only the primary process needs to directly interact with VLM/Task logic
+            # Assume all envs have the same Task type and grab the reference from env 0
             
-        #     env_list = getattr(self.envs, "_envs", None)
-        #     if env_list is None:
-        #         env_list = getattr(self.envs, "_vector_envs", None)
+            env_list = getattr(self.envs, "_envs", None)
+            if env_list is None:
+                env_list = getattr(self.envs, "_vector_envs", None)
 
-        #     first_env = env_list[0] if env_list and len(env_list) > 0 else None
+            first_env = env_list[0] if env_list and len(env_list) > 0 else None
             
-        #     if first_env is not None:
-        #         if hasattr(first_env, "task"):
-        #             self._task_ref = first_env.task
-        #             logger.info("[PPOTrainer] Task reference found for forced VLM calls.")
-        #         else:
-        #             logger.error("[PPOTrainer] Could not find task reference! Forced VLM calls will fail.")
-        #     else:
-        #          logger.error("[PPOTrainer] Could not retrieve the list of underlying environment objects! Forced VLM calls will fail.")
+            if first_env is not None:
+                if hasattr(first_env, "task"):
+                    self._task_ref = first_env.task
+                    logger.info("[PPOTrainer] Task reference found for forced VLM calls.")
+                else:
+                    logger.error("[PPOTrainer] Could not find task reference! Forced VLM calls will fail.")
+            else:
+                 logger.error("[PPOTrainer] Could not retrieve the list of underlying environment objects! Forced VLM calls will fail.")
 
         self.device = get_device(self.config)
 
@@ -362,15 +376,12 @@ class PPOTrainer(BaseRLTrainer):
         )
         self.prev_distance_to_goal = torch.zeros(self.envs.num_envs, 1).to(self.device)
         self.prev_actions = torch.zeros(self.envs.num_envs, dtype=torch.long)
+        self.active_thoughts = [None] * self.envs.num_envs
+        self.stuck_counter = torch.zeros(self.envs.num_envs, dtype=torch.long).to(self.device)
 
         self.last_non_think_action = torch.full(
             (self.envs.num_envs,), 
             fill_value=-1, 
-            dtype=torch.long
-        ).to(self.device)
-
-        self.steps_since_think = torch.zeros(
-            self.envs.num_envs, 
             dtype=torch.long
         ).to(self.device)
 
@@ -517,7 +528,9 @@ class PPOTrainer(BaseRLTrainer):
             3: "TURN_RIGHT",
             4: "THINK"
         }
- 
+        
+        STUCK_THRESHOLD = 3
+
         with g_timer.avg_time("trainer.update_stats"):
             observations = self.envs.post_step(observations)
             batch = batch_obs(observations, device=self.device)
@@ -538,71 +551,92 @@ class PPOTrainer(BaseRLTrainer):
 
             for i, info in enumerate(infos):
                 env_idx = env_slice.start + i
+
                 prev_action = int(self.prev_actions[env_idx].item())
+                prev_action_name = ACTION_MAP.get(prev_action, "UNKNOWN")
                 
-                # Calculate distance change
+                did_agent_choose_think = prev_action_name == "THINK"
+
+                # --- STUCK COUNTER LOGIC ---
+                last_non_think_action = self.last_non_think_action[env_idx].item()
+                
+                if not did_agent_choose_think:
+                    # If it's a movement/stop action
+                    if prev_action == last_non_think_action:
+                        # Same action repeated
+                        self.stuck_counter[env_idx] += 1
+                    else:
+                        # Action changed: reset counter and start tracking the new action
+                        self.stuck_counter[env_idx] = 1 
+                        self.last_non_think_action[env_idx] = prev_action
+                else:
+                    # Agent chose THINK: reset stuck counter and clear the last action to track
+                    self.stuck_counter[env_idx] = 0
+                    self.last_non_think_action[env_idx] = -1 # Clear the tracked action
+                
+                is_agent_stuck = self.stuck_counter[env_idx] >= STUCK_THRESHOLD
+                should_force_think = is_agent_stuck and not did_agent_choose_think
+
+                if self._task_ref is not None and should_force_think:
+                    # Force VLM Update
+                    self.stuck_counter[env_idx] = 0 # Reset counter
+                    self.last_non_think_action[env_idx] = -1 # Clear the tracked action
+                    
+                    if hasattr(self._task_ref, "vlm_action"):
+                        vlm_action_instance = self._task_ref.vlm_action
+                        vlm_action_instance.step(self._task_ref) # Call ThinkAction.step directly
+                        
+                        new_thought_text = self._task_ref.latest_thought_text
+                        
+                        logger.warning(
+                            f"[VLM_FORCED] Env {env_idx} stuck ({STUCK_THRESHOLD}x {prev_action_name}). "
+                            f"Task updated. Next observation will contain thought: '{new_thought_text[:40]}...'"
+                        )
+                # --- END STUCK COUNTER LOGIC ---
+
                 prev_distances = self.prev_distance_to_goal[env_slice]
                 distance_change = prev_distances[i].item() - current_distances[i].item()
-                
+
                 # Check if a new thought was generated THIS step
                 new_thought = info.get("latest_thought_text", None)
                 
-                # Track steps since last think
-                if prev_action == 4:  # THINK action
-                    self.steps_since_think[env_idx] = 0
-                    # Apply THINK penalty
-                    rewards[i] -= 0.1  # ← Meaningful penalty
+                if new_thought is not None:
+                    # Give THINK penalty
+                    rewards[i] -= 0.0001
+                    sys.stderr.write(f"Env {env_idx} | Action: THINK -> Generated thought: '{new_thought[:40]}...' PENALTY -0.0001\n")
+                    sys.stderr.flush()
                     
-                    if new_thought is not None:
-                        # Store new thought for next action
-                        self.active_thoughts[env_idx] = new_thought
-                        sys.stderr.write(
-                            f"Env {env_idx} | THINK -> '{new_thought[:40]}...' "
-                            f"PENALTY -0.1\n"
-                        )
+                    # Store this thought for the NEXT action to be evaluated against
+                    self.active_thoughts[env_idx] = new_thought
+                
+                elif self.active_thoughts[env_idx] is not None:
+                    # There's an active thought from a previous THINK, 
+                    # evaluate THIS action against it
+                    thought_text = self.active_thoughts[env_idx]
+                    
+                    consistency = is_action_consistent_with_thought(
+                        prev_action, thought_text, distance_change
+                    )
+                    log_prefix = f"Env {env_idx} | Action: {ACTION_MAP.get(prev_action, 'Unknown')} | Thought: '{thought_text[:30]}...'"
+                    
+                    if consistency > 0:
+                        # Consistent - apply positive reward
+                        # Scale the reward by the score. 
+                        rewards[i] += consistency
+                        sys.stderr.write(f"{log_prefix} -> CONSISTENT (+{consistency:.2f})\n")
                         sys.stderr.flush()
-                else:
-                    # Non-THINK action
-                    self.steps_since_think[env_idx] += 1
+                    elif consistency < 0:
+                        # Inconsistent - apply penalty
+                        rewards[i] -= consistency
+                        sys.stderr.write(f"{log_prefix} -> INCONSISTENT -{consistency:.2f} penalty.\n")
+                        sys.stderr.flush()
+                    else:
+                        # Neutral (consistency == 0) - no reward or penalty
+                        sys.stderr.write(f"{log_prefix} -> NEUTRAL (no directional command).\n")
+                        sys.stderr.flush()
                     
-                    # Evaluate action against active thought (if any)
-                    if self.active_thoughts[env_idx] is not None:
-                        thought_text = self.active_thoughts[env_idx]
-                        thought_lower = thought_text.lower()
-                        
-                        # Give small bonus for following useful advice
-                        bonus = 0.0
-                        
-                        # Forward bonus
-                        forward_keywords = ["forward", "move", "go", "approach"]
-                        if any(kw in thought_lower for kw in forward_keywords):
-                            if prev_action == 1 and distance_change > 0.01:  # MOVE_FORWARD + progress
-                                bonus = 0.5
-                                sys.stderr.write(
-                                    f"Env {env_idx} | MOVE_FORWARD (thought: 'forward') "
-                                    f"+ progress → BONUS +0.5\n"
-                                )
-                        
-                        # Turn left bonus
-                        elif "left" in thought_lower and prev_action == 2:  # TURN_LEFT
-                            bonus = 0.1
-                            sys.stderr.write(
-                                f"Env {env_idx} | TURN_LEFT (thought: 'left') → BONUS +0.1\n"
-                            )
-                        
-                        # Turn right bonus
-                        elif "right" in thought_lower and prev_action == 3:  # TURN_RIGHT
-                            bonus = 0.1
-                            sys.stderr.write(
-                                f"Env {env_idx} | TURN_RIGHT (thought: 'right') → BONUS +0.1\n"
-                            )
-                        
-                        if bonus > 0:
-                            rewards[i] += bonus
-                            sys.stderr.flush()
-                        
-                        # Clear thought after using it once
-                        self.active_thoughts[env_idx] = None
+                    # Clear the thought after evaluating one action against it
+                    self.active_thoughts[env_idx] = None
 
             self.prev_distance_to_goal[env_slice] = current_distances
 
