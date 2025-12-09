@@ -44,4 +44,4 @@ measurements:
     success_distance: 0.3
   distance_to_goal_reward:
     type: DistanceToGoalReward
-    multiplier: 50.0
+    multiplier: 10.0
