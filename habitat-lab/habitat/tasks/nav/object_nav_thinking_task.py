@@ -168,13 +168,13 @@ class ThoughtSensor(Sensor):
         import sys
         # Return the thought embedding from the task if available
         if task.thought is not None:
-            sys.stderr.write(f"[THOUGHT_SENSOR] Returning thought embedding with shape {task.thought.shape}\n")
-            sys.stderr.flush()
+            # sys.stderr.write(f"[THOUGHT_SENSOR] Returning thought embedding with shape {task.thought.shape}\n")
+            # sys.stderr.flush()
             return task.thought.astype(np.float32)
         else:
             # Complain when thought is not available
-            sys.stderr.write(f"[THOUGHT_SENSOR] WARNING: task.thought is None! Returning zeros.\n")
-            sys.stderr.flush()
+            # sys.stderr.write(f"[THOUGHT_SENSOR] WARNING: task.thought is None! Returning zeros.\n")
+            # sys.stderr.flush()
             return np.zeros(512, dtype=np.float32)
 
 @registry.register_task(name="ObjectNavThinking-v1")
@@ -192,25 +192,27 @@ class ObjectNavigationThinkingTask(ObjectNavigationTask):
         self.thought: Optional[np.ndarray] = None
         self.last_image: Optional[np.ndarray] = None
         self.target_object: Optional[str] = None
+        self.latest_thought_text: Optional[str] = None
 
     def reset(self, episode):
         import sys
         observations = super().reset(episode)
         self.thought = None
+        self.latest_thought_text = None
 
         # Store the target object category from the episode
         if hasattr(episode, 'object_category'):
             self.target_object = episode.object_category
-            sys.stderr.write(f"[TASK_RESET] Target object set to: '{self.target_object}'\n")
-            sys.stderr.flush()
-        else:
-            sys.stderr.write(f"[TASK_RESET] WARNING: Episode has no object_category attribute\n")
-            sys.stderr.flush()
+            # sys.stderr.write(f"[TASK_RESET] Target object set to: '{self.target_object}'\n")
+            # sys.stderr.flush()
+        # else:
+            # sys.stderr.write(f"[TASK_RESET] WARNING: Episode has no object_category attribute\n")
+            # sys.stderr.flush()
 
         # Store initial observation so it's available for think action
         self.last_image = observations["rgb"]
-        sys.stderr.write(f"[TASK_RESET] Stored initial image with shape: {self.last_image.shape}\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"[TASK_RESET] Stored initial image with shape: {self.last_image.shape}\n")
+        # sys.stderr.flush()
 
         return observations
 
@@ -226,7 +228,18 @@ class ObjectNavigationThinkingTask(ObjectNavigationTask):
 
         # Update with the observation after action
         self.last_image = observation["rgb"]
+
         return observation
+
+    # def get_metrics(self):
+    #     """Override get_metrics to include thought text."""
+    #     metrics = super().get_metrics()
+        
+    #     # Add thought text as a metric if available
+    #     if self.latest_thought_text is not None:
+    #         metrics["latest_thought_text"] = self.latest_thought_text
+        
+    #     return metrics
 
 
 @registry.register_task_action
@@ -240,14 +253,14 @@ class ThinkAction(SimulatorTaskAction):
         # Determine device
         self.device = "mps" if torch.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
 
-        sys.stderr.write(f"[THINK_ACTION_INIT] Initializing ThinkAction with device={self.device}\n")
-        sys.stderr.flush()
-        sys.stderr.write(f"[THINK_ACTION_INIT] Loading CLIP model ViT-B/32...\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"[THINK_ACTION_INIT] Initializing ThinkAction with device={self.device}\n")
+        # sys.stderr.flush()
+        # sys.stderr.write(f"[THINK_ACTION_INIT] Loading CLIP model ViT-B/32...\n")
+        # sys.stderr.flush()
         self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
         self.model.eval()
-        sys.stderr.write(f"[THINK_ACTION_INIT] CLIP model loaded successfully on {self.device}\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"[THINK_ACTION_INIT] CLIP model loaded successfully on {self.device}\n")
+        # sys.stderr.flush()
         self.vlm = Qwen3VLForConditionalGeneration.from_pretrained(
             "Qwen/Qwen3-VL-2B-Instruct", dtype="auto", device_map="auto"
         )
@@ -255,20 +268,20 @@ class ThinkAction(SimulatorTaskAction):
 
     def think(self, observation_image, target_object):
         import sys
-        sys.stderr.write(f"\n[VLM_THINK] ========== VLM INFERENCE START ==========\n")
-        sys.stderr.write(f"[VLM_THINK] Target object: '{target_object}'\n")
-        sys.stderr.write(f"[VLM_THINK] Image shape: {observation_image.shape}\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"\n[VLM_THINK] ========== VLM INFERENCE START ==========\n")
+        # sys.stderr.write(f"[VLM_THINK] Target object: '{target_object}'\n")
+        # sys.stderr.write(f"[VLM_THINK] Image shape: {observation_image.shape}\n")
+        # sys.stderr.flush()
 
         prompt_text = f"What is the next thing that the robot must do to find {target_object}"
-        sys.stderr.write(f"[VLM_THINK] Prompt: {prompt_text}\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"[VLM_THINK] Prompt: {prompt_text}\n")
+        # sys.stderr.flush()
 
         messages = [
             {
                 "role": "system",
                 "content": [
-                    {"type": "text", "text": "You are a guide for a robot that is navigating a home. Yourr job is to provide subgoals for the robot's navigation. You will be given an image and a target object to find. You have to reply with the next step for the robot, such as find the bedroom door. Be brief, do NOT report your thinking or observations. ONLY report succinctly what the robot must do next in a single sentence."},
+                    {"type": "text", "text": "You are an AI guiding a robot's immediate next action. You are given an image and a target object (e.g., 'find the spoon'). Your goal is to output the STRICTLY NECESSARY NEXT STEP the robot must take. DO NOT include observations, reasoning, or explanations. OUTPUT ONLY A SINGLE sentence, SHORT COMMAND."},
                 ],
             },
             {
@@ -283,8 +296,8 @@ class ThinkAction(SimulatorTaskAction):
             }
         ]
 
-        sys.stderr.write(f"[VLM_THINK] Processing chat template...\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"[VLM_THINK] Processing chat template...\n")
+        # sys.stderr.flush()
 
         inputs = self.processor.apply_chat_template(
             messages,
@@ -295,8 +308,8 @@ class ThinkAction(SimulatorTaskAction):
         )
         inputs = inputs.to(self.vlm.device)
 
-        sys.stderr.write(f"[VLM_THINK] Generating response (max_new_tokens=128)...\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"[VLM_THINK] Generating response (max_new_tokens=128)...\n")
+        # sys.stderr.flush()
 
         generated_ids = self.vlm.generate(**inputs, max_new_tokens=128)
         generated_ids_trimmed = [
@@ -307,34 +320,35 @@ class ThinkAction(SimulatorTaskAction):
         )
 
         sys.stderr.write(f"[VLM_THINK] VLM Response: '{output_text[0] if output_text else 'EMPTY'}'\n")
-        sys.stderr.write(f"[VLM_THINK] ========== VLM INFERENCE END ==========\n\n")
+        # sys.stderr.write(f"[VLM_THINK] ========== VLM INFERENCE END ==========\n\n")
         sys.stderr.flush()
 
         return output_text
 
     def embed_thought(self, thought):
         import sys
-        sys.stderr.write(f"[THINK_ACTION_EMBED] Embedding thought: '{thought}'\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"[THINK_ACTION_EMBED] Embedding thought: '{thought}'\n")
+        # sys.stderr.flush()
         text = clip.tokenize([thought]).to(self.device)
-        sys.stderr.write(f"[THINK_ACTION_EMBED] Tokenized text shape: {text.shape}\n")
-        sys.stderr.flush()
-        text_features = self.model.encode_text(text)
-        sys.stderr.write(f"[THINK_ACTION_EMBED] CLIP features shape: {text_features.shape}, dtype: {text_features.dtype}\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"[THINK_ACTION_EMBED] Tokenized text shape: {text.shape}\n")
+        # sys.stderr.flush()
+        with torch.no_grad():
+            text_features = self.model.encode_text(text)
+        # sys.stderr.write(f"[THINK_ACTION_EMBED] CLIP features shape: {text_features.shape}, dtype: {text_features.dtype}\n")
+        # sys.stderr.flush()
         result = text_features.detach().cpu().numpy()[0]
-        sys.stderr.write(f"[THINK_ACTION_EMBED] Final embedding shape: {result.shape}, dtype: {result.dtype}\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"[THINK_ACTION_EMBED] Final embedding shape: {result.shape}, dtype: {result.dtype}\n")
+        # sys.stderr.flush()
         return result
 
     def reset(self, task: ObjectNavigationThinkingTask, *args: Any, **kwargs: Any):
         import sys
-        sys.stderr.write(f"[THINK_ACTION_RESET] Called\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"[THINK_ACTION_RESET] Called\n")
+        # sys.stderr.flush()
         thought = "resetted thought text"
         task.thought = self.embed_thought(thought)
-        sys.stderr.write(f"[THINK_ACTION_RESET] Set task.thought shape={task.thought.shape}, dtype={task.thought.dtype}\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"[THINK_ACTION_RESET] Set task.thought shape={task.thought.shape}, dtype={task.thought.dtype}\n")
+        # sys.stderr.flush()
 
 
     def step(self, task: ObjectNavigationThinkingTask, *args: Any, **kwargs: Any):
@@ -342,50 +356,50 @@ class ThinkAction(SimulatorTaskAction):
         ``step``.
         """
         import sys
-        sys.stderr.write(f"\n{'='*60}\n")
-        sys.stderr.write(f"[THINK_ACTION_STEP] *** STEP CALLED ***\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"\n{'='*60}\n")
+        # sys.stderr.write(f"[THINK_ACTION_STEP] *** STEP CALLED ***\n")
+        # sys.stderr.flush()
 
-        # Debug: Check what's available
-        sys.stderr.write(f"[THINK_ACTION_STEP] Checking availability:\n")
-        sys.stderr.write(f"[THINK_ACTION_STEP]   task.last_image: {task.last_image is not None} (shape={task.last_image.shape if task.last_image is not None else 'N/A'})\n")
-        sys.stderr.write(f"[THINK_ACTION_STEP]   task.target_object: {task.target_object is not None} (value='{task.target_object}')\n")
-        sys.stderr.write(f"[THINK_ACTION_STEP]   self.vlm: {self.vlm is not None}\n")
-        sys.stderr.write(f"[THINK_ACTION_STEP]   self.processor: {self.processor is not None}\n")
-        sys.stderr.flush()
+        # # Debug: Check what's available
+        # sys.stderr.write(f"[THINK_ACTION_STEP] Checking availability:\n")
+        # sys.stderr.write(f"[THINK_ACTION_STEP]   task.last_image: {task.last_image is not None} (shape={task.last_image.shape if task.last_image is not None else 'N/A'})\n")
+        # sys.stderr.write(f"[THINK_ACTION_STEP]   task.target_object: {task.target_object is not None} (value='{task.target_object}')\n")
+        # sys.stderr.write(f"[THINK_ACTION_STEP]   self.vlm: {self.vlm is not None}\n")
+        # sys.stderr.write(f"[THINK_ACTION_STEP]   self.processor: {self.processor is not None}\n")
+        # sys.stderr.flush()
 
         # Get the target object and current image
         if task.last_image is None:
-            sys.stderr.write(f"[THINK_ACTION_STEP] ERROR: task.last_image is None!\n")
-            sys.stderr.flush()
+            # sys.stderr.write(f"[THINK_ACTION_STEP] ERROR: task.last_image is None!\n")
+            # sys.stderr.flush()
             thought = "Navigate forward to explore the environment"
         elif task.target_object is None:
-            sys.stderr.write(f"[THINK_ACTION_STEP] ERROR: task.target_object is None!\n")
-            sys.stderr.flush()
+            # sys.stderr.write(f"[THINK_ACTION_STEP] ERROR: task.target_object is None!\n")
+            # sys.stderr.flush()
             thought = "Navigate forward to explore the environment"
         else:
-            sys.stderr.write(f"[THINK_ACTION_STEP] All checks passed. Calling VLM...\n")
-            sys.stderr.flush()
+            # sys.stderr.write(f"[THINK_ACTION_STEP] All checks passed. Calling VLM...\n")
+            # sys.stderr.flush()
 
             # Call VLM to generate thought based on observation and target
-            sys.stderr.write(f"[THINK_ACTION_STEP] About to call self.think()\n")
-            sys.stderr.flush()
+            # sys.stderr.write(f"[THINK_ACTION_STEP] About to call self.think()\n")
+            # sys.stderr.flush()
 
             vlm_output = self.think(task.last_image, task.target_object)
 
-            sys.stderr.write(f"[THINK_ACTION_STEP] self.think() returned successfully\n")
-            sys.stderr.flush()
+            # sys.stderr.write(f"[THINK_ACTION_STEP] self.think() returned successfully\n")
+            # sys.stderr.flush()
 
             thought = vlm_output[0] if isinstance(vlm_output, list) else vlm_output
-            sys.stderr.write(f"[THINK_ACTION_STEP] VLM generated thought: '{thought}'\n")
-            sys.stderr.flush()
+            # sys.stderr.write(f"[THINK_ACTION_STEP] VLM generated thought: '{thought}'\n")
+            # sys.stderr.flush()
 
         # Embed the thought using CLIP
-        sys.stderr.write(f"[THINK_ACTION_STEP] About to embed thought with CLIP\n")
-        sys.stderr.flush()
-
+        # sys.stderr.write(f"[THINK_ACTION_STEP] About to embed thought with CLIP\n")
+        # sys.stderr.flush()
+        task.latest_thought_text = thought
         task.thought = self.embed_thought(thought)
 
-        sys.stderr.write(f"[THINK_ACTION_STEP] Set task.thought shape={task.thought.shape}, dtype={task.thought.dtype}\n")
-        sys.stderr.write(f"{'='*60}\n\n")
-        sys.stderr.flush()
+        # sys.stderr.write(f"[THINK_ACTION_STEP] Set task.thought shape={task.thought.shape}, dtype={task.thought.dtype}\n")
+        # sys.stderr.write(f"{'='*60}\n\n")
+        # sys.stderr.flush()

@@ -364,10 +364,10 @@ def overlay_frame(frame, info, additional=None):
     lines = []
     flattened_info = flatten_dict(info)
     for k, v in flattened_info.items():
-        if isinstance(v, str):
-            lines.append(f"{k}: {v}")
-        else:
+        if isinstance(v, (int, float)):
             lines.append(f"{k}: {v:.2f}")
+        else:
+            lines.append(f"{k}: {v}")
     if additional is not None:
         lines.extend(additional)
 

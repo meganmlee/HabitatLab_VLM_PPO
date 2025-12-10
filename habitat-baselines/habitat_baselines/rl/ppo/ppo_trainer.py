@@ -8,6 +8,7 @@ import contextlib
 import os
 import random
 import time
+import sys
 from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
@@ -66,6 +67,63 @@ from habitat_baselines.utils.info_dict import (
 )
 from habitat_baselines.utils.timing import g_timer
 
+def is_action_consistent_with_thought(
+    action: int,
+    thought_text: str,
+    distance_change: float) -> float:
+
+    ACTION_MAP = {
+        0: "STOP", 
+        1: "MOVE_FORWARD", 
+        2: "TURN_LEFT", 
+        3: "TURN_RIGHT",
+        4: "THINK"
+    } 
+    action_name = ACTION_MAP.get(action, "UNKNOWN")
+    thought_text = thought_text.lower()
+
+    nav_keywords = [
+        "left", "right", "forward", "back", 
+        "turn", "move", "go", "stop", 
+        "approach", "find", "search"
+    ]
+    
+    # 1. Filter: If no navigation intent, return Neutral
+    if not any(k in thought_text for k in nav_keywords):
+        return 0.0
+
+    # 2. Turn Logic: Low Reward (Prevents "Spinning" Profit)
+    # We give a small positive reward (0.2) to acknowledge the VLM 
+    # identified the direction correctly, but it's not enough to 
+    # outweigh the cost of thinking/time unless necessary.
+    if "left" in thought_text:
+        return 0.05 if action_name == "TURN_LEFT" else -0.25
+        
+    if "right" in thought_text:
+        return 0.05 if action_name == "TURN_RIGHT" else -0.25
+
+    # 3. Stop Logic: High Reward (Safety Critical)
+    if "stop" in thought_text:
+        return 0.1 if action_name == "STOP" else -0.25
+
+    # 4. Forward Logic: High Reward (Progress Critical)
+    # This is the "Breadcrumb" - we pay big for moving closer.
+    forward_intent = "forward" in thought_text or \
+                     any(k in thought_text for k in ["move", "go", "approach", "find"])
+                     
+    if forward_intent:
+        if action_name != "MOVE_FORWARD":
+            # If thought says "go" but robot turned/stopped -> Inconsistent
+            return -0.25
+        
+        # If thought says "go" and robot moved forward:
+        # CHECK: Did we actually move? (Avoid wall-bumping)
+        if distance_change > 0.01:
+            return 0.25  # JACKPOT: Consistent + Progress
+        else:
+            return 0.1  # Consistent but no progress (e.g. wall)
+    
+    return 0.0
 
 @baseline_registry.register_trainer(name="ddppo")
 @baseline_registry.register_trainer(name="ppo")
@@ -89,6 +147,13 @@ class PPOTrainer(BaseRLTrainer):
         self._is_static_encoder = False
         self._encoder = None
         self._env_spec = None
+
+        self.prev_distance_to_goal = None
+        self._task_ref = None # Will store a reference to the task instance
+        self.stuck_counter = torch.zeros(self.config.habitat_baselines.num_environments, dtype=torch.int) # To track consecutive same actions per env
+        self.prev_actions = torch.zeros(self.config.habitat_baselines.num_environments, dtype=torch.long)
+        self.active_thoughts = [None] * self.config.habitat_baselines.num_environments
+        self.last_non_think_action = None
 
         # Distributed if the world size would be
         # greater than 1
@@ -228,21 +293,42 @@ class PPOTrainer(BaseRLTrainer):
 
         # remove the non scalar measures from the measures since they can only be used in
         # evaluation
-        for non_scalar_metric in NON_SCALAR_METRICS:
-            non_scalar_metric_root = non_scalar_metric.split(".")[0]
-            if non_scalar_metric_root in self.config.habitat.task.measurements:
-                with read_write(self.config):
-                    OmegaConf.set_struct(self.config, False)
-                    self.config.habitat.task.measurements.pop(
-                        non_scalar_metric_root
-                    )
-                    OmegaConf.set_struct(self.config, True)
-                if self.config.habitat_baselines.verbose:
-                    logger.info(
-                        f"Removed metric {non_scalar_metric_root} from metrics since it cannot be used during training."
-                    )
+        # for non_scalar_metric in NON_SCALAR_METRICS:
+        #     if non_scalar_metric == "latest_thought_text":
+        #         continue
+        #     non_scalar_metric_root = non_scalar_metric.split(".")[0]
+        #     if non_scalar_metric_root in self.config.habitat.task.measurements:
+        #         with read_write(self.config):
+        #             OmegaConf.set_struct(self.config, False)
+        #             self.config.habitat.task.measurements.pop(
+        #                 non_scalar_metric_root
+        #             )
+        #             OmegaConf.set_struct(self.config, True)
+        #         if self.config.habitat_baselines.verbose:
+        #             logger.info(
+        #                 f"Removed metric {non_scalar_metric_root} from metrics since it cannot be used during training."
+        #             )
 
         self._init_envs()
+
+        if rank0_only():
+            # Only the primary process needs to directly interact with VLM/Task logic
+            # Assume all envs have the same Task type and grab the reference from env 0
+            
+            env_list = getattr(self.envs, "_envs", None)
+            if env_list is None:
+                env_list = getattr(self.envs, "_vector_envs", None)
+
+            first_env = env_list[0] if env_list and len(env_list) > 0 else None
+            
+            if first_env is not None:
+                if hasattr(first_env, "task"):
+                    self._task_ref = first_env.task
+                    logger.info("[PPOTrainer] Task reference found for forced VLM calls.")
+                else:
+                    logger.error("[PPOTrainer] Could not find task reference! Forced VLM calls will fail.")
+            else:
+                 logger.error("[PPOTrainer] Could not retrieve the list of underlying environment objects! Forced VLM calls will fail.")
 
         self.device = get_device(self.config)
 
@@ -288,6 +374,16 @@ class PPOTrainer(BaseRLTrainer):
         self.window_episode_stats = defaultdict(
             lambda: deque(maxlen=self._ppo_cfg.reward_window_size)
         )
+        self.prev_distance_to_goal = torch.zeros(self.envs.num_envs, 1).to(self.device)
+        self.prev_actions = torch.zeros(self.envs.num_envs, dtype=torch.long)
+        self.active_thoughts = [None] * self.envs.num_envs
+        self.stuck_counter = torch.zeros(self.envs.num_envs, dtype=torch.long).to(self.device)
+
+        self.last_non_think_action = torch.full(
+            (self.envs.num_envs,), 
+            fill_value=-1, 
+            dtype=torch.long
+        ).to(self.device)
 
         self.t_start = time.time()
 
@@ -378,14 +474,19 @@ class PPOTrainer(BaseRLTrainer):
             ):
                 if is_continuous_action_space(self._env_spec.action_space):
                     # Clipping actions to the specified limits
-                    act = np.clip(
+                    act_val = np.clip(
                         act.numpy(),
                         self._env_spec.action_space.low,
                         self._env_spec.action_space.high,
                     )
+                    # Store first element for continuous actions
+                    action_id = int(act[0].item())
                 else:
-                    act = act.item()
-                self.envs.async_step_at(index_env, act)
+                    act_val = act.item()
+                    # Store the discrete action
+                    action_id = act_val
+                self.prev_actions[index_env] = action_id
+                self.envs.async_step_at(index_env, act_val)
 
         with g_timer.avg_time("trainer.obs_insert"):
             self._agent.rollouts.insert(
@@ -415,10 +516,25 @@ class PPOTrainer(BaseRLTrainer):
                 list(x) for x in zip(*outputs)
             ]
 
+            current_distances_list = []
+
+            for i, info in enumerate(infos):
+                current_distances_list.append(info.get("distance_to_goal", 0.0))
+
+        ACTION_MAP = {
+            0: "STOP", 
+            1: "MOVE_FORWARD", 
+            2: "TURN_LEFT", 
+            3: "TURN_RIGHT",
+            4: "THINK"
+        }
+        
+        STUCK_THRESHOLD = 3
+
         with g_timer.avg_time("trainer.update_stats"):
             observations = self.envs.post_step(observations)
             batch = batch_obs(observations, device=self.device)
-            batch = apply_obs_transforms_batch(batch, self.obs_transforms)  # type: ignore
+            batch = apply_obs_transforms_batch(batch, self.obs_transforms)
 
             rewards = torch.tensor(
                 rewards_l,
@@ -427,9 +543,102 @@ class PPOTrainer(BaseRLTrainer):
             )
             rewards = rewards.unsqueeze(1)
 
+            current_distances = torch.tensor(
+                current_distances_list,
+                dtype=torch.float,
+                device=self.current_episode_reward.device,
+            ).unsqueeze(1)
+
             for i, info in enumerate(infos):
-                if info.get('success', 0.0) > 0.5:
-                    rewards[i] += 2.5
+                env_idx = env_slice.start + i
+
+                prev_action = int(self.prev_actions[env_idx].item())
+                prev_action_name = ACTION_MAP.get(prev_action, "UNKNOWN")
+                
+                did_agent_choose_think = prev_action_name == "THINK"
+
+                # --- STUCK COUNTER LOGIC ---
+                last_non_think_action = self.last_non_think_action[env_idx].item()
+                
+                if not did_agent_choose_think:
+                    # If it's a movement/stop action
+                    if prev_action == last_non_think_action:
+                        # Same action repeated
+                        self.stuck_counter[env_idx] += 1
+                    else:
+                        # Action changed: reset counter and start tracking the new action
+                        self.stuck_counter[env_idx] = 1 
+                        self.last_non_think_action[env_idx] = prev_action
+                else:
+                    # Agent chose THINK: reset stuck counter and clear the last action to track
+                    self.stuck_counter[env_idx] = 0
+                    self.last_non_think_action[env_idx] = -1 # Clear the tracked action
+                
+                is_agent_stuck = self.stuck_counter[env_idx] >= STUCK_THRESHOLD
+                should_force_think = is_agent_stuck and not did_agent_choose_think
+
+                if self._task_ref is not None and should_force_think:
+                    # Force VLM Update
+                    self.stuck_counter[env_idx] = 0 # Reset counter
+                    self.last_non_think_action[env_idx] = -1 # Clear the tracked action
+                    
+                    if hasattr(self._task_ref, "vlm_action"):
+                        vlm_action_instance = self._task_ref.vlm_action
+                        vlm_action_instance.step(self._task_ref) # Call ThinkAction.step directly
+                        
+                        new_thought_text = self._task_ref.latest_thought_text
+                        
+                        logger.warning(
+                            f"[VLM_FORCED] Env {env_idx} stuck ({STUCK_THRESHOLD}x {prev_action_name}). "
+                            f"Task updated. Next observation will contain thought: '{new_thought_text[:40]}...'"
+                        )
+                # --- END STUCK COUNTER LOGIC ---
+
+                prev_distances = self.prev_distance_to_goal[env_slice]
+                distance_change = prev_distances[i].item() - current_distances[i].item()
+
+                # Check if a new thought was generated THIS step
+                new_thought = info.get("latest_thought_text", None)
+                
+                if new_thought is not None:
+                    # Give THINK penalty
+                    rewards[i] -= 0.0001
+                    sys.stderr.write(f"Env {env_idx} | Action: THINK -> Generated thought: '{new_thought[:40]}...' PENALTY -0.0001\n")
+                    sys.stderr.flush()
+                    
+                    # Store this thought for the NEXT action to be evaluated against
+                    self.active_thoughts[env_idx] = new_thought
+                
+                elif self.active_thoughts[env_idx] is not None:
+                    # There's an active thought from a previous THINK, 
+                    # evaluate THIS action against it
+                    thought_text = self.active_thoughts[env_idx]
+                    
+                    consistency = is_action_consistent_with_thought(
+                        prev_action, thought_text, distance_change
+                    )
+                    log_prefix = f"Env {env_idx} | Action: {ACTION_MAP.get(prev_action, 'Unknown')} | Thought: '{thought_text[:30]}...'"
+                    
+                    if consistency > 0:
+                        # Consistent - apply positive reward
+                        # Scale the reward by the score. 
+                        rewards[i] += consistency
+                        sys.stderr.write(f"{log_prefix} -> CONSISTENT (+{consistency:.2f})\n")
+                        sys.stderr.flush()
+                    elif consistency < 0:
+                        # Inconsistent - apply penalty
+                        rewards[i] += consistency
+                        sys.stderr.write(f"{log_prefix} -> INCONSISTENT -{consistency:.2f} penalty.\n")
+                        sys.stderr.flush()
+                    else:
+                        # Neutral (consistency == 0) - no reward or penalty
+                        sys.stderr.write(f"{log_prefix} -> NEUTRAL (no directional command).\n")
+                        sys.stderr.flush()
+                    
+                    # Clear the thought after evaluating one action against it
+                    self.active_thoughts[env_idx] = None
+
+            self.prev_distance_to_goal[env_slice] = current_distances
 
             not_done_masks = torch.tensor(
                 [[not done] for done in dones],
