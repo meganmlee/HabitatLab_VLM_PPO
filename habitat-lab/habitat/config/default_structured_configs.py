@@ -1378,7 +1378,7 @@ class DistanceToGoalRewardMeasurementConfig(MeasurementConfig):
     decrease of distance to the goal.
     """
     type: str = "DistanceToGoalReward"
-    multiplier: float = 1.0
+    multiplier: float = 50.0
 
 
 @dataclass

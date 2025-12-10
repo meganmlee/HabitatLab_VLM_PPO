@@ -104,7 +104,7 @@ def is_action_consistent_with_thought(
 
     # 3. Stop Logic: High Reward (Safety Critical)
     if "stop" in thought_text:
-        return 2.0 if action_name == "STOP" else -0.25
+        return 0.1 if action_name == "STOP" else -0.25
 
     # 4. Forward Logic: High Reward (Progress Critical)
     # This is the "Breadcrumb" - we pay big for moving closer.
@@ -114,7 +114,7 @@ def is_action_consistent_with_thought(
     if forward_intent:
         if action_name != "MOVE_FORWARD":
             # If thought says "go" but robot turned/stopped -> Inconsistent
-            return -0.5
+            return -0.25
         
         # If thought says "go" and robot moved forward:
         # CHECK: Did we actually move? (Avoid wall-bumping)
@@ -627,7 +627,7 @@ class PPOTrainer(BaseRLTrainer):
                         sys.stderr.flush()
                     elif consistency < 0:
                         # Inconsistent - apply penalty
-                        rewards[i] -= consistency
+                        rewards[i] += consistency
                         sys.stderr.write(f"{log_prefix} -> INCONSISTENT -{consistency:.2f} penalty.\n")
                         sys.stderr.flush()
                     else:
