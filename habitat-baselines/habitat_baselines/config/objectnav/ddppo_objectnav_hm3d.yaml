@@ -12,8 +12,8 @@ habitat:
     iterator_options:
       max_scene_repeat_steps: 50000
   task:
-    success_reward: 2.5
-    slack_reward: -1e-3
+    success_reward: 15.0
+    slack_reward: -0.01
 
 habitat_baselines:
   torch_gpu_id: 0
@@ -24,7 +24,7 @@ habitat_baselines:
   num_environments: 4
   checkpoint_folder: "data/new_checkpoints"
   trainer_name: "ddppo"
-  num_updates: 270000
+  num_updates: 50000
   log_interval: 10
   num_checkpoints: 100
   # Force PyTorch to be single threaded as
@@ -44,9 +44,9 @@ habitat_baselines:
       # ppo params
       clip_param: 0.2
       ppo_epoch: 4
-      num_mini_batch: 2
+      num_mini_batch: 4
       value_loss_coef: 0.5
-      entropy_coef: 0.01
+      entropy_coef: 0.001
       lr: 2.5e-4
       eps: 1e-5
       max_grad_norm: 0.2

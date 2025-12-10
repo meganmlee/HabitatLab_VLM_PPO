@@ -1,8 +1,13 @@
 # @package _global_
 
+# Single-process PPO config for local testing
+# Based on ppo_pointnav_example.yaml
+
 defaults:
   - /habitat_baselines: habitat_baselines_rl_config_base
-  - /benchmark/nav/objectnav: objectnav_mp3d
+  - /benchmark/nav/objectnav: objectnav_thinking_hm3d
+  - /habitat_baselines/rl/policy/obs_transforms@habitat_baselines.rl.policy.main_agent.obs_transforms.resize_shortest_edge: resize_shortest_edge_base
+  - /habitat_baselines/rl/policy/obs_transforms@habitat_baselines.rl.policy.main_agent.obs_transforms.center_cropper: center_cropper_base
   - _self_
 
 habitat:
@@ -14,6 +19,7 @@ habitat:
     slack_reward: -0.01
 
 habitat_baselines:
+  trainer_name: "ddppo"
   torch_gpu_id: 0
   tensorboard_dir: "tb"
   video_dir: "video_dir"
@@ -21,29 +27,27 @@ habitat_baselines:
   eval_ckpt_path_dir: "data/new_checkpoints"
   num_environments: 4
   checkpoint_folder: "data/new_checkpoints"
-  trainer_name: "ddppo"
   num_updates: 50000
   log_interval: 20
   num_checkpoints: 100
-  # Force PyTorch to be single threaded as
-  # this improves performance considerably
   force_torch_single_threaded: True
 
   eval:
     split: "val"
+    video_option: ["disk", "tensorboard"]
 
   rl:
     policy:
       main_agent:
-        name: "PointNavResNetPolicy"
+        name: "PointNavResNetThinkingPolicy"
 
     ppo:
       # ppo params
       clip_param: 0.2
       ppo_epoch: 4
-      num_mini_batch: 4
+      num_mini_batch: 4  # ← Must be <= num_environments
       value_loss_coef: 0.5
-      entropy_coef: 0.001
+      entropy_coef: 0.01
       lr: 2.5e-4
       eps: 1e-5
       max_grad_norm: 0.2
@@ -54,27 +58,8 @@ habitat_baselines:
       use_linear_clip_decay: False
       use_linear_lr_decay: False
       reward_window_size: 50
-
       use_normalized_advantage: False
-
       hidden_size: 512
 
     ddppo:
-      sync_frac: 0.6
-      # The PyTorch distributed backend to use
-      distrib_backend: NCCL
-      # Visual encoder backbone
-      pretrained_weights: data/ddppo-models/gibson-2plus-resnet50.pth
-      # Initialize with pretrained weights
-      pretrained: False
-      # Initialize just the visual encoder backbone with pretrained weights
-      pretrained_encoder: False
-      # Whether or not the visual encoder backbone will be trained.
-      train_encoder: True
-      # Whether or not to reset the critic linear layer
-      reset_critic: True
-
-      # Model parameters
-      backbone: resnet50
-      rnn_type: LSTM
-      num_recurrent_layers: 2
+      backbone: aligned_clip

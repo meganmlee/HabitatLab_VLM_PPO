@@ -8,6 +8,7 @@ import contextlib
 import os
 import random
 import time
+import sys
 from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
@@ -66,6 +67,51 @@ from habitat_baselines.utils.info_dict import (
 )
 from habitat_baselines.utils.timing import g_timer
 
+def is_action_consistent_with_thought(
+    action: int,
+    thought_text: str,
+    distance_change: float) -> float:
+
+    ACTION_MAP = {
+        0: "STOP", 
+        1: "MOVE_FORWARD", 
+        2: "TURN_LEFT", 
+        3: "TURN_RIGHT",
+        4: "THINK"
+    } 
+    action_name = ACTION_MAP.get(action, "UNKNOWN")
+    thought_text = thought_text.lower()
+
+    nav_keywords = [
+        "left", "right", "forward", "back", 
+        "turn", "move", "go", "stop", 
+        "approach", "find", "search"
+    ]
+    
+    # 1. Filter: If no navigation intent, return Neutral
+    if not any(k in thought_text for k in nav_keywords):
+        return 0.0
+
+    # Turn Logic: Low Reward (Prevents "Spinning" Profit)
+    if "left" in thought_text and action_name == "TURN_LEFT":
+        return 0.01
+        
+    if "right" in thought_text and action_name == "TURN_RIGHT":
+        return 0.01
+
+    # Stop Logic: High Reward (Safety Critical)
+    if "stop" in thought_text and action_name == "STOP":
+        return 0.1
+
+    # Forward Logic
+    forward_intent = "forward" in thought_text or \
+                     any(k in thought_text for k in ["approach", "find"])
+                     
+    if forward_intent:
+        if action_name == "MOVE_FORWARD" and distance_change > 0.02:
+            return 1.0  # JACKPOT: Consistent + Progress
+    
+    return 0.0
 
 @baseline_registry.register_trainer(name="ddppo")
 @baseline_registry.register_trainer(name="ppo")
@@ -89,6 +135,8 @@ class PPOTrainer(BaseRLTrainer):
         self._is_static_encoder = False
         self._encoder = None
         self._env_spec = None
+
+        self.prev_distance_to_goal = None
 
         # Distributed if the world size would be
         # greater than 1
@@ -228,19 +276,21 @@ class PPOTrainer(BaseRLTrainer):
 
         # remove the non scalar measures from the measures since they can only be used in
         # evaluation
-        for non_scalar_metric in NON_SCALAR_METRICS:
-            non_scalar_metric_root = non_scalar_metric.split(".")[0]
-            if non_scalar_metric_root in self.config.habitat.task.measurements:
-                with read_write(self.config):
-                    OmegaConf.set_struct(self.config, False)
-                    self.config.habitat.task.measurements.pop(
-                        non_scalar_metric_root
-                    )
-                    OmegaConf.set_struct(self.config, True)
-                if self.config.habitat_baselines.verbose:
-                    logger.info(
-                        f"Removed metric {non_scalar_metric_root} from metrics since it cannot be used during training."
-                    )
+        # for non_scalar_metric in NON_SCALAR_METRICS:
+        #     if non_scalar_metric == "latest_thought_text":
+        #         continue
+        #     non_scalar_metric_root = non_scalar_metric.split(".")[0]
+        #     if non_scalar_metric_root in self.config.habitat.task.measurements:
+        #         with read_write(self.config):
+        #             OmegaConf.set_struct(self.config, False)
+        #             self.config.habitat.task.measurements.pop(
+        #                 non_scalar_metric_root
+        #             )
+        #             OmegaConf.set_struct(self.config, True)
+        #         if self.config.habitat_baselines.verbose:
+        #             logger.info(
+        #                 f"Removed metric {non_scalar_metric_root} from metrics since it cannot be used during training."
+        #             )
 
         self._init_envs()
 
@@ -288,6 +338,9 @@ class PPOTrainer(BaseRLTrainer):
         self.window_episode_stats = defaultdict(
             lambda: deque(maxlen=self._ppo_cfg.reward_window_size)
         )
+        self.prev_distance_to_goal = torch.zeros(self.envs.num_envs, 1).to(self.device)
+        self.prev_actions = torch.zeros(self.envs.num_envs, dtype=torch.long)
+        self.active_thoughts = [None] * self.envs.num_envs
 
         self.t_start = time.time()
 
@@ -378,14 +431,19 @@ class PPOTrainer(BaseRLTrainer):
             ):
                 if is_continuous_action_space(self._env_spec.action_space):
                     # Clipping actions to the specified limits
-                    act = np.clip(
+                    act_val = np.clip(
                         act.numpy(),
                         self._env_spec.action_space.low,
                         self._env_spec.action_space.high,
                     )
+                    # Store first element for continuous actions
+                    self.prev_actions[index_env] = int(act[0].item())
                 else:
-                    act = act.item()
-                self.envs.async_step_at(index_env, act)
+                    act_val = act.item()
+                    # Store the discrete action
+                    self.prev_actions[index_env] = act_val
+                
+                self.envs.async_step_at(index_env, act_val)
 
         with g_timer.avg_time("trainer.obs_insert"):
             self._agent.rollouts.insert(
@@ -415,6 +473,19 @@ class PPOTrainer(BaseRLTrainer):
                 list(x) for x in zip(*outputs)
             ]
 
+            current_distances_list = []
+
+            for i, info in enumerate(infos):
+                current_distances_list.append(info.get("distance_to_goal", 0.0))
+
+        ACTION_MAP = {
+            0: "STOP", 
+            1: "MOVE_FORWARD", 
+            2: "TURN_LEFT", 
+            3: "TURN_RIGHT",
+            4: "THINK"
+        }
+
         with g_timer.avg_time("trainer.update_stats"):
             observations = self.envs.post_step(observations)
             batch = batch_obs(observations, device=self.device)
@@ -427,9 +498,55 @@ class PPOTrainer(BaseRLTrainer):
             )
             rewards = rewards.unsqueeze(1)
 
+            current_distances = torch.tensor(
+                current_distances_list,
+                dtype=torch.float,
+                device=self.current_episode_reward.device,
+            ).unsqueeze(1)
+
             for i, info in enumerate(infos):
-                if info.get('success', 0.0) > 0.5:
-                    rewards[i] += 2.5
+                env_idx = env_slice.start + i
+
+                prev_action = int(self.prev_actions[env_idx].item())
+
+                prev_distances = self.prev_distance_to_goal[env_slice]
+                distance_change = prev_distances[i].item() - current_distances[i].item()
+            
+                # Check if a new thought was generated THIS step
+                new_thought = info.get("latest_thought_text", None)
+                
+                if new_thought is not None:
+                    # THINK action was just executed
+                    # Give THINK penalty
+                    rewards[i] -= 0.05
+                    sys.stderr.write(f"Env {env_idx} | Action: THINK -> Generated thought: '{new_thought[:40]}...' PENALTY -0.05\n")
+                    sys.stderr.flush()
+                    
+                    # Store this thought for the NEXT action to be evaluated against
+                    self.active_thoughts[env_idx] = {
+                        'text': new_thought,
+                    }
+                
+                elif self.active_thoughts[env_idx] is not None:
+                    # There's an active thought from a previous THINK, 
+                    # evaluate THIS action against it
+                    thought_data = self.active_thoughts[env_idx]
+                    thought_text = thought_data['text']
+                    
+                    consistency = is_action_consistent_with_thought(
+                        prev_action, thought_text, distance_change
+                    )
+                    log_prefix = f"Env {env_idx} | Action: {ACTION_MAP.get(prev_action, 'Unknown')} | Thought: '{thought_text[:30]}...'"
+                    
+                    if consistency > 0.0:
+                        rewards[i] += consistency
+                        sys.stderr.write(f"{log_prefix} -> CONSISTENT (+{consistency})\n")
+                        sys.stderr.flush()
+    
+                    # Clear the thought after evaluating one action against it
+                    self.active_thoughts[env_idx] = None
+
+            self.prev_distance_to_goal[env_slice] = current_distances
 
             not_done_masks = torch.tensor(
                 [[not done] for done in dones],
