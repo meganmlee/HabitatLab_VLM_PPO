@@ -1013,7 +1013,6 @@ class DistanceToGoalReward(Measure):
     ):
         self._sim = sim
         self._config = config
-        self._multiplier = config.get("multiplier", 1.0)
         self._previous_distance: Optional[float] = None
         super().__init__()
 
@@ -1035,7 +1034,7 @@ class DistanceToGoalReward(Measure):
         distance_to_target = task.measurements.measures[
             DistanceToGoal.cls_uuid
         ].get_metric()
-        self._metric = -(distance_to_target - self._previous_distance) * self._multiplier
+        self._metric = -(distance_to_target - self._previous_distance)
         self._previous_distance = distance_to_target
 
 
